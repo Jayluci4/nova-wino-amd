@@ -1,18 +1,26 @@
 # NOVA Winograd F(6,3) for AMD MI300X
 
-**Production-quality large-tile Winograd convolution in FP16 that beats MIOpen.**
+**Prototype large-tile Winograd convolution in FP16 that works with MIOpen.**
 
 NOVA uses optimized interpolation points to make F(6,3) Winograd numerically stable in half-precision — solving the exact instability that caused AMD, NVIDIA, and every major framework to abandon large-tile Winograd.
 
-## Key Results (AMD Instinct MI300X)
+MIOpen ships Winograd only at F(2,3). There are no production kernels at larger tile sizes on any AMD GPU, and there never have been. MIOpen’s codebase contains infrastructure for F(4,3) through
+F(6,3), but it was abandoned because standard interpolation points are numerically unstable in reduced precision.
 
-| Metric | Result |
-|--------|--------|
-| **Batch=1 latency vs MIOpen F(2,3)** | **NOVA wins by 17–57%** |
-| ImageNetV2 top-1 accuracy | 63.29% (baseline 63.15%) |
-| Standard F(6,3) FP16 accuracy | 31.07% (221K NaN — broken) |
-| Stable Diffusion 1.5 UNet | 49/49 layers, 0.98x MIOpen, valid images |
-| NaN / Inf | **Zero** |
+This report presents a working F(6,3) Winograd HIP kernel with PyTorch integration that
+addresses the numerical stability gap:
+• Faster than MIOpen at batch=1: 17% to 57% lower latency across all ResNet-50 layers.
+• No accuracy loss: 63.29% top-1 on ImageNetV2 (10K images) vs. 63.15% FP32 baseline.
+• No NaN/Inf: Standard F(6,3) produces 221,000 NaN values on the same test. NOVA produces
+zero.
+• Drop-in replacement: One function call replaces all eligible Conv2d layers in any model.
+• Stable Diffusion: 49/49 SD 1.5 UNet convolutions replaced, valid 512×512 images, 0.98× MIOpen
+step latency.
+• Multiple architectures: Also validated on SDXL (38 layers, 1024×1024) and DenseNet-161 (78
+layers, ImageNetV2 accuracy preserved).
+The fix is mathematical, not architectural. NOVA selects interpolation points that minimize
+condition numbers, bringing the maximum matrix entry from ∼10 down to 2.72, which is within
+FP16 dynamic range.
 
 <p align="center">
   <img src="docs/report/figures/latency_b1.png" width="600" alt="NOVA beats MIOpen at batch=1">
