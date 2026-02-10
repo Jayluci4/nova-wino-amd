@@ -1,0 +1,35 @@
+# Build artifacts
+*.so
+*.o
+*.d
+build/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# LaTeX
+docs/report/*.aux
+docs/report/*.log
+docs/report/*.out
+docs/report/*.toc
+docs/report/*.synctex.gz
+docs/report/*.fls
+docs/report/*.fdb_latexmk
+
+# Benchmark outputs
+*.json
+
+# OS
+.DS_Store
+Thumbs.db
