@@ -16,7 +16,7 @@
 \usepackage{colortbl}
 \usepackage{float}
 
-% Modern font stack — Adobe Source family
+% Font stack
 \usepackage[default,regular]{sourceserifpro}   % Body text
 \usepackage[semibold]{sourcesanspro}            % Sans-serif for headings
 \usepackage[scale=0.88]{sourcecodepro}          % Monospace
@@ -27,7 +27,7 @@
 \definecolor{darkgray}{HTML}{333333}
 \definecolor{medgray}{HTML}{555555}
 
-% Section headings — sans-serif, modern
+% Section headings
 \titlespacing*{\section}{0pt}{1.5ex plus 0.5ex}{0.8ex plus 0.2ex}
 \titlespacing*{\subsection}{0pt}{1ex plus 0.3ex}{0.5ex plus 0.1ex}
 \titleformat{\section}{\large\sffamily\bfseries\color{darkgray}}{\thesection}{0.8em}{}
@@ -40,13 +40,13 @@
 \setlength{\abovecaptionskip}{4pt}
 \setlength{\belowcaptionskip}{2pt}
 
-% Captions — sans-serif, slightly smaller
+% Captions
 \captionsetup{font={small,sf}, labelfont={bf}}
 
 % Header
 \pagestyle{fancy}
 \fancyhf{}
-\rhead{\small\sffamily\color{gray}NOVA on MI300X --- Technical Report}
+\rhead{\small\sffamily\color{gray}NOVA on MI300X | Technical Report}
 \lhead{\small\sffamily\color{gray}Jayant Lohia}
 \rfoot{\small\sffamily\thepage}
 \renewcommand{\headrulewidth}{0.4pt}
@@ -59,8 +59,8 @@
 % TITLE
 % ═══════════════════════════════════════════════════════════════
 \begin{center}
-{\LARGE\sffamily\bfseries NOVA on MI300X: Production-Quality F(6,3)\\[4pt]
-Winograd in FP16 That Beats MIOpen}\\[12pt]
+{\LARGE\sffamily\bfseries NOVA on MI300X: F(6,3)\\[4pt]
+Winograd in FP16}\\[12pt]
 {\large\sffamily Jayant Lohia}\\[4pt]
 {\normalsize\sffamily\color{medgray} February 2026}\\[8pt]
 \rule{0.6\textwidth}{0.5pt}
@@ -73,20 +73,20 @@ Winograd in FP16 That Beats MIOpen}\\[12pt]
 % ═══════════════════════════════════════════════════════════════
 \section{Executive Summary}
 
-MIOpen has Winograd kernels only at F(2,3). There are no production kernels at larger tile sizes on any AMD GPU---and never have been. MIOpen's own codebase contains complete infrastructure for F(4,3) through F(6,3), but it was abandoned due to numerical instability in reduced precision.
+MIOpen ships Winograd only at F(2,3). There are no production kernels at larger tile sizes on any AMD GPU, and there never have been. MIOpen's codebase contains infrastructure for F(4,3) through F(6,3), but it was abandoned because standard interpolation points are numerically unstable in reduced precision.
 
-\textbf{I built the missing kernel.} In two weeks, on a single MI300X, I implemented a full-performance F(6,3) Winograd convolution as a HIP kernel with PyTorch integration. The results:
+This report presents a working F(6,3) Winograd HIP kernel with PyTorch integration that addresses the numerical stability gap:
 
 \begin{itemize}[nosep, leftmargin=1.5em]
-    \item \textbf{Beats MIOpen at batch=1 inference} by 17--57\% across all ResNet-50 layers.
-    \item \textbf{Zero accuracy loss}: 63.29\% top-1 on ImageNetV2 (10K images) vs.\ 63.15\% FP32 baseline.
-    \item \textbf{Zero NaN/Inf}: Standard F(6,3) produces 221,000 NaN values on the same test. NOVA produces zero.
-    \item \textbf{Drop-in PyTorch replacement}: One function call replaces all eligible Conv2d layers in any model.
-    \item \textbf{Stable Diffusion works}: 49/49 UNet convolutions replaced, valid 512$\times$512 images generated, at 0.98$\times$ MIOpen step latency.
-    \item \textbf{Generalizes across architectures}: SDXL (38 layers, 1024$\times$1024) and DenseNet-161 (78 layers, full ImageNetV2 accuracy preserved).
+    \item \textbf{Faster than MIOpen at batch=1}: 17\% to 57\% lower latency across all ResNet-50 layers.
+    \item \textbf{No accuracy loss}: 63.29\% top-1 on ImageNetV2 (10K images) vs.\ 63.15\% FP32 baseline.
+    \item \textbf{No NaN/Inf}: Standard F(6,3) produces 221,000 NaN values on the same test. NOVA produces zero.
+    \item \textbf{Drop-in replacement}: One function call replaces all eligible Conv2d layers in any model.
+    \item \textbf{Stable Diffusion}: 49/49 SD 1.5 UNet convolutions replaced, valid 512$\times$512 images, 0.98$\times$ MIOpen step latency.
+    \item \textbf{Multiple architectures}: Also validated on SDXL (38 layers, 1024$\times$1024) and DenseNet-161 (78 layers, ImageNetV2 accuracy preserved).
 \end{itemize}
 
-The fix is mathematical, not architectural. NOVA selects optimal interpolation points for the Winograd transform that minimize condition numbers, reducing the maximum matrix entry from ${\sim}10$ to $2.72$---safely within FP16 dynamic range. This solves the exact instability that blocked AMD's prior attempts.
+The fix is mathematical, not architectural. NOVA selects interpolation points that minimize condition numbers, bringing the maximum matrix entry from ${\sim}10$ down to $2.72$, which is within FP16 dynamic range.
 
 % ═══════════════════════════════════════════════════════════════
 % WHAT I BUILT
@@ -95,41 +95,41 @@ The fix is mathematical, not architectural. NOVA selects optimal interpolation p
 
 \subsection{HIP Kernel: Multi-Pass F(6,3) Winograd}
 
-The kernel follows the same multi-pass architecture that MIOpen uses for F(2,3), extended to the larger F(6,3) tile size with NOVA's numerically stable transform matrices:
+The kernel follows the same multi-pass architecture that MIOpen uses for F(2,3), extended to the F(6,3) tile size with NOVA's transform matrices:
 
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.95\textwidth]{figures/architecture.png}
-    \caption{NOVA F(6,3) multi-pass architecture. Input and output transforms are custom HIP kernels using wave shuffles (zero shared memory). The GEMM uses rocBLAS strided batched GEMM with FP32 accumulation via MFMA.}
+    \caption{NOVA F(6,3) multi-pass architecture. Input and output transforms are HIP kernels using wave shuffles (no shared memory). The GEMM uses rocBLAS strided batched GEMM with FP32 accumulation via MFMA.}
     \label{fig:arch}
 \end{figure}
 
-\noindent Key implementation details:
+\noindent Implementation details:
 
 \begin{itemize}[nosep, leftmargin=1.5em]
-    \item \textbf{Transforms}: HIP kernels, 4 tiles per workgroup (256 threads = 4 wavefronts), register-only via \texttt{\_\_shfl} wave shuffles---zero LDS usage.
-    \item \textbf{GEMM}: rocBLAS \texttt{gemm\_strided\_batched\_ex}---64 batches, FP16 inputs, FP32 accumulation via MFMA (\texttt{mfma\_f32\_16x16x16f16}).
-    \item \textbf{Filter transform}: Computed once in FP32, cached as FP16. Zero cost on subsequent forward passes.
-    \item \textbf{Precision}: FP16 throughout transforms (safe because NOVA's max entry is 2.72), FP32 accumulation in GEMM.
+    \item \textbf{Transforms}: HIP kernels, 4 tiles per workgroup (256 threads = 4 wavefronts), register-only via \texttt{\_\_shfl} wave shuffles, no LDS.
+    \item \textbf{GEMM}: rocBLAS \texttt{gemm\_strided\_batched\_ex}, 64 batches, FP16 inputs, FP32 accumulation via MFMA (\texttt{mfma\_f32\_16x16x16f16}).
+    \item \textbf{Filter transform}: Computed once in FP32, cached as FP16. No cost on subsequent forward passes.
+    \item \textbf{Precision}: FP16 throughout transforms (NOVA's max entry is 2.72, so this is safe), FP32 accumulation in GEMM.
 \end{itemize}
 
 \subsection{PyTorch Integration}
 
-The kernel is accessible from Python as a drop-in replacement for \texttt{torch.nn.Conv2d}:
+The kernel is accessible from Python as a replacement for \texttt{torch.nn.Conv2d}:
 
 \begin{verbatim}
     from nova_winograd_ext import replace_conv2d_with_nova
 
     model = torchvision.models.resnet50(pretrained=True).cuda().half()
-    replace_conv2d_with_nova(model)  # That's it. 13 layers replaced.
+    replace_conv2d_with_nova(model)  # 13 layers replaced.
     output = model(input)            # Uses NOVA F(6,3) automatically.
 \end{verbatim}
 
-\noindent Additional capabilities:
+\noindent Also included:
 \begin{itemize}[nosep, leftmargin=1.5em]
-    \item \texttt{NovaWinogradConv2d.from\_conv2d(conv)} --- single-layer drop-in replacement
-    \item \texttt{NovaWinogradConv2dTrainable} --- HIP forward pass, FP32 native backward pass
-    \item \texttt{NovaWinogradConv2dCompilable} --- compatible with \texttt{torch.compile(fullgraph=True)}
+    \item \texttt{NovaWinogradConv2d.from\_conv2d(conv)}: single-layer replacement
+    \item \texttt{NovaWinogradConv2dTrainable}: HIP forward pass, FP32 native backward pass
+    \item \texttt{NovaWinogradConv2dCompilable}: works with \texttt{torch.compile(fullgraph=True)}
     \item Full \texttt{torch.autograd} support with verified gradients ($<$0.03\% error vs.\ native)
 \end{itemize}
 
@@ -142,24 +142,24 @@ The kernel is accessible from Python as a drop-in replacement for \texttt{torch.
 
 All results collected on AMD Instinct MI300X (304 CUs, 205.8\,GB HBM3, ROCm 6.3, PyTorch 2.9.1).
 
-\subsection{Batch=1 Inference: NOVA Beats MIOpen}
+\subsection{Batch=1 Inference Latency}
 
-At batch size 1---the latency-critical case for interactive inference and single-request serving---NOVA's F(6,3) beats MIOpen's native F(2,3) on \textbf{every ResNet-50 layer}:
+At batch size 1 (the common case for interactive inference and single-request serving), NOVA's F(6,3) is faster than MIOpen's F(2,3) on every ResNet-50 layer:
 
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.85\textwidth]{figures/latency_b1.png}
-    \caption{Batch=1 latency comparison. NOVA F(6,3) is faster than MIOpen's production F(2,3) across all four ResNet-50 convolutional stages. The advantage grows with channel count (conv4\_x: 2.3$\times$ faster) because the 5.6$\times$ arithmetic reduction of F(6,3) vs.\ F(2,3) increasingly dominates.}
+    \caption{Batch=1 latency comparison. NOVA F(6,3) is faster across all four ResNet-50 convolutional stages. The gap grows with channel count (conv4\_x: 2.3$\times$ faster) because the 5.6$\times$ arithmetic reduction of F(6,3) vs.\ F(2,3) starts to dominate.}
     \label{fig:latency}
 \end{figure}
 
-This is the headline result: \textbf{a kernel that AMD's own team couldn't ship now outperforms the one they did ship}, for the workload that matters most (latency-bound inference).
+At batch=1, the arithmetic reduction of F(6,3) vs.\ F(2,3) outweighs the multi-pass dispatch overhead, resulting in lower latency across all tested configurations.
 
 \subsection{Full Performance Profile}
 
 \begin{table}[H]
 \centering
-\caption{Performance across batch sizes. NOVA wins at B=1 (latency-critical). MIOpen's fused F(2,3) kernel wins at larger batches due to single-dispatch advantage. The gap narrows with \texttt{fp16\_alt\_impl} (see Section~\ref{sec:future}).}
+\caption{Performance across batch sizes. NOVA wins at B=1. MIOpen's fused F(2,3) kernel wins at larger batches due to single-dispatch advantage. The gap narrows with \texttt{fp16\_alt\_impl} (see Section~\ref{sec:future}).}
 \label{tab:perf}
 \small
 \begin{tabular}{lrrrrr}
@@ -180,20 +180,20 @@ conv3\_x [B=32] & 0.066\,ms & 0.223\,ms & 2.866\,ms & 3.36$\times$ & 12.9$\times
 \end{tabular}
 \end{table}
 
-\subsection{ImageNetV2: Zero Accuracy Loss}
+\subsection{ImageNetV2: No Accuracy Loss}
 
 Evaluated on ImageNetV2 matched-frequency (10,000 images, 1,000 classes) using pretrained ResNet-50 with 13 of 16 3$\times$3 convolutions replaced (3 stride-2 layers are ineligible for Winograd):
 
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.85\textwidth]{figures/imagenet_accuracy.png}
-    \caption{ImageNetV2 top-1 accuracy. NOVA F(6,3) in FP16 preserves full accuracy (63.29\%, McNemar $p=0.28$ vs.\ baseline---not statistically different). Standard F(6,3) in FP16 collapses to 31.07\% with 221,000 NaN values---a catastrophic 32-point accuracy drop.}
+    \caption{ImageNetV2 top-1 accuracy. NOVA F(6,3) in FP16 preserves accuracy (63.29\%, McNemar $p=0.28$ vs.\ baseline, not statistically different). Standard F(6,3) in FP16 drops to 31.07\% with 221,000 NaN values.}
     \label{fig:accuracy}
 \end{figure}
 
 \begin{table}[H]
 \centering
-\caption{ImageNetV2 accuracy summary. NOVA F(6,3) in FP16 is the only large-tile configuration that preserves accuracy. Standard points are catastrophically broken.}
+\caption{ImageNetV2 accuracy summary. NOVA F(6,3) in FP16 is the only large-tile configuration that preserves accuracy. Standard points produce unusable results.}
 \label{tab:accuracy}
 \small
 \begin{tabular}{lcccc}
@@ -214,19 +214,19 @@ Standard F(6,3) FP16 & \cellcolor{red!15}31.07 & \cellcolor{red!15}53.44 & \cell
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.9\textwidth]{figures/stability.png}
-    \caption{Left: Relative error of FP16 convolution vs.\ FP32 direct convolution. NOVA achieves 5.2\% error; standard F(6,3) exceeds 200\%. Right: NaN/Inf counts---NOVA produces exactly zero across all tests, while standard points generate hundreds to hundreds of thousands.}
+    \caption{Left: Relative error of FP16 convolution vs.\ FP32 direct convolution. NOVA gets 5.2\% error; standard F(6,3) exceeds 200\%. Right: NaN/Inf counts. NOVA produces zero across all tests, while standard points generate hundreds to hundreds of thousands.}
     \label{fig:stability}
 \end{figure}
 
-The stability improvement factor is \textbf{38.8$\times$} (relative error: 5.2\% NOVA vs.\ 201\% standard). This is the direct consequence of NOVA's condition number optimization: the F(6,3) $B^T$ matrix condition number drops from $\sim$100 (standard) to $\sim$8 (NOVA).
+The stability improvement is 38.8$\times$ (relative error: 5.2\% NOVA vs.\ 201\% standard). This comes from the condition number reduction: the F(6,3) $B^T$ matrix condition number drops from $\sim$100 (standard) to $\sim$8 (NOVA).
 
 \subsection{Stable Diffusion: End-to-End Validation}
 
-Stable Diffusion 1.5 is the ultimate stress test: the UNet runs 20+ denoising steps, each involving 49 eligible 3$\times$3 convolutions. Any numerical instability accumulates across steps, destroying the generated image.
+Stable Diffusion 1.5 is a good stress test for numerical stability: the UNet runs 20+ denoising steps, each involving 49 eligible 3$\times$3 convolutions. Any instability accumulates across steps and ruins the generated image.
 
 \begin{table}[H]
 \centering
-\caption{Stable Diffusion 1.5 UNet benchmark. NOVA replaces all 49 eligible Conv2d layers and achieves parity with MIOpen at near-identical step latency, with zero numerical failures.}
+\caption{Stable Diffusion 1.5 UNet benchmark. NOVA replaces all 49 eligible Conv2d layers at near-identical step latency, with no numerical failures.}
 \label{tab:sd}
 \small
 \begin{tabular}{lcc}
@@ -244,20 +244,20 @@ Image quality & Baseline & Visually identical \\
 
 \begin{figure}[H]
     \centering
-    \includegraphics[width=0.32\textwidth]{figures/sd_output.png}
-    \caption{Image generated by Stable Diffusion 1.5 with all 49 UNet convolutions replaced by NOVA F(6,3) in FP16. The image is coherent and artifact-free, confirming numerical stability across 20 denoising steps.}
+    \includegraphics[width=0.40\textwidth]{figures/sdxl_output.png}
+    \caption{1024$\times$1024 image generated by SDXL with all 38 eligible UNet convolutions replaced by NOVA F(6,3) in FP16. No visible artifacts after 20 denoising steps.}
     \label{fig:sd}
 \end{figure}
 
-\noindent\textbf{Note on model architectures}: Newer diffusion models (SD3, Flux, SORA) use DiT (Diffusion Transformer) architectures built primarily on attention layers, not convolutions. Winograd does not apply to attention. However, UNet-based models (SD~1.5, SDXL, ControlNet, inpainting variants) remain the most widely deployed diffusion architectures and are dominated by 3$\times$3 convolutions.
+\noindent\textbf{A note on model architectures}: Newer diffusion models (SD3, Flux, SORA) use DiT (Diffusion Transformer) architectures based on attention layers, not convolutions. Winograd does not apply to attention. UNet-based models (SD~1.5, SDXL, ControlNet, inpainting variants) are still the most widely deployed diffusion architectures and rely heavily on 3$\times$3 convolutions.
 
 \subsection{SDXL: 1024$\times$1024 Generation}
 
-To validate beyond SD~1.5, we tested on SDXL Base---a larger UNet generating at 1024$\times$1024 resolution:
+To validate beyond SD~1.5, I also tested on SDXL Base, a larger UNet that generates at 1024$\times$1024 resolution:
 
 \begin{table}[H]
 \centering
-\caption{SDXL Base UNet benchmark. NOVA replaces all eligible Conv2d layers and generates valid 1024$\times$1024 images with zero numerical failures.}
+\caption{SDXL Base UNet benchmark. NOVA replaces all eligible Conv2d layers and generates valid 1024$\times$1024 images with no numerical failures.}
 \label{tab:sdxl}
 \small
 \begin{tabular}{lcc}
@@ -274,16 +274,16 @@ Image quality & Baseline & Visually identical \\
 
 \subsection{DenseNet-161: Architecture Generality}
 
-DenseNet-161 provides a different validation profile from ResNet-50: \textbf{78 eligible layers} (6$\times$ more than ResNet's 13) with smaller channel sizes (48--192 vs.\ 64--512). This exercises a broader range of the kernel's configuration space.
+DenseNet-161 has a different profile from ResNet-50: \textbf{78 eligible layers} (6$\times$ more than ResNet's 13) with smaller channel sizes (48 to 192 vs.\ 64 to 512). This covers a wider range of the kernel's configuration space.
 
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.75\textwidth]{figures/model_generality.png}
-    \caption{Eligible 3$\times$3 stride-1 convolution layers across architectures. DenseNet-161 has the most replaceable layers. Models dominated by depthwise convolutions (EfficientNet, MobileNet, ConvNeXt) have zero eligible layers.}
+    \caption{Eligible 3$\times$3 stride-1 convolution layers by architecture. DenseNet-161 has the most replaceable layers. Models that use depthwise convolutions (EfficientNet, MobileNet, ConvNeXt) have zero eligible layers.}
     \label{fig:generality}
 \end{figure}
 
-\noindent Full ImageNetV2 validation (10,000 images) on DenseNet-161 confirms zero accuracy degradation with NOVA F(6,3) in FP16, matching the ResNet-50 result on a fundamentally different architecture.
+\noindent Full ImageNetV2 validation (10,000 images) on DenseNet-161 confirms no accuracy degradation with NOVA F(6,3) in FP16, matching the ResNet-50 result on a different architecture.
 
 % ═══════════════════════════════════════════════════════════════
 % WHY THIS MATTERS
@@ -292,33 +292,33 @@ DenseNet-161 provides a different validation profile from ResNet-50: \textbf{78 
 
 \subsection{AMD Already Built the Infrastructure}
 
-MIOpen's source code contains a complete multi-pass Winograd framework for F(4,3) through F(6,3): C++ solver classes, assembly transform templates, GEMM integration, and xDLOps (MFMA) variants. \textbf{None of it ever shipped.} There are zero performance database entries for these solvers on any GPU generation (gfx906, gfx908, gfx90a, gfx942). The infrastructure was abandoned because standard interpolation points are numerically unstable in FP16.
+MIOpen's source code contains a multi-pass Winograd framework for F(4,3) through F(6,3): C++ solver classes, assembly transform templates, GEMM integration, and xDLOps (MFMA) variants. None of it shipped. There are zero performance database entries for these solvers on any GPU generation (gfx906, gfx908, gfx90a, gfx942). The infrastructure was abandoned because standard interpolation points are numerically unstable in FP16.
 
-NOVA solves this exact problem. The kernel I built uses the same architectural pattern MIOpen's team designed---just with different transform matrices. \textbf{Integration into MIOpen would complete work that AMD already invested in.}
+NOVA's interpolation points address this problem. The prototype kernel follows the same architectural pattern MIOpen's team designed, just with different transform matrices. Integration into MIOpen would build on work that AMD already invested in.
 
-\subsection{Competitive Advantage Over NVIDIA}
+\subsection{Competitive Landscape}
 
-NVIDIA has moved \textit{away} from Winograd:
+NVIDIA has moved away from Winograd:
 \begin{itemize}[nosep, leftmargin=1.5em]
-    \item cuDNN's maximum was F(4,3) in FP32 only---never F(6,3), never with Tensor Cores.
+    \item cuDNN's maximum was F(4,3) in FP32 only. They never had F(6,3) or Tensor Core integration.
     \item Fused Winograd is explicitly blocked on Hopper (SM 90) and later.
-    \item NVIDIA's strategy is to rely on raw Tensor Core throughput instead.
+    \item NVIDIA's approach is to rely on raw Tensor Core throughput instead.
 \end{itemize}
 
-If AMD ships F(6,3) Winograd with NOVA points, it would offer a capability that \textbf{no NVIDIA GPU has}---a 5.6$\times$ arithmetic advantage over F(2,3) that NVIDIA cannot match with their current software stack.
+If AMD ships F(6,3) Winograd with NOVA points, it would offer a capability that no NVIDIA GPU has: a 5.6$\times$ arithmetic reduction over F(2,3) that NVIDIA cannot match with their current software stack.
 
 \subsection{The \texttt{fp16\_alt} Opportunity}
 \label{sec:future}
 
-During rocBLAS tuning, I discovered that the \texttt{fp16\_alt\_impl} flag (an alternate FP16 MFMA datapath) provides \textbf{1.6--33$\times$ GEMM speedup} on rocBLAS 5 (ROCm 7.1). This flag is not available on the rocBLAS 4 bundled with PyTorch's current ROCm 6.3 wheels. When PyTorch ships ROCm 7.x support, the batch$>$1 performance gap closes significantly---\textbf{with zero code changes to the kernel}.
+During rocBLAS tuning, the \texttt{fp16\_alt\_impl} flag (an alternate FP16 MFMA datapath) showed 1.6$\times$ to 33$\times$ GEMM speedup on rocBLAS 5 (ROCm 7.1). This flag is not available on the rocBLAS 4 bundled with PyTorch's current ROCm 6.3 wheels. When PyTorch ships ROCm 7.x support, the batch$>$1 performance gap closes with no code changes to the kernel.
 
 \subsection{Business Impact}
 
 \begin{enumerate}[nosep, leftmargin=1.5em]
-    \item \textbf{Inference latency}: Batch=1 wins directly translate to lower per-request latency for serving workloads.
-    \item \textbf{Generative AI}: Stable Diffusion, Flux, and other diffusion models are 90\%+ convolutions. F(6,3) Winograd reduces arithmetic by 5.6$\times$ per layer.
-    \item \textbf{Differentiation}: ``The only GPU platform with large-tile Winograd in FP16'' is a concrete, defensible marketing claim.
-    \item \textbf{Low integration cost}: The architecture matches MIOpen's existing multi-pass framework. The delta is transform matrices and a new solver entry---not a rewrite.
+    \item \textbf{Inference latency}: Batch=1 wins translate to lower per-request latency for serving workloads.
+    \item \textbf{Generative AI}: UNet-based diffusion models are dominated by 3$\times$3 convolutions. F(6,3) Winograd reduces arithmetic by 5.6$\times$ per layer.
+    \item \textbf{Differentiation}: ``The only GPU platform with large-tile Winograd in FP16'' is a concrete claim.
+    \item \textbf{Low integration cost}: The architecture matches MIOpen's existing multi-pass framework. The delta is transform matrices and a new solver entry, not a rewrite.
 \end{enumerate}
 
 % ═══════════════════════════════════════════════════════════════
@@ -326,7 +326,7 @@ During rocBLAS tuning, I discovered that the \texttt{fp16\_alt\_impl} flag (an a
 % ═══════════════════════════════════════════════════════════════
 \section{Reproduction}
 
-All code runs on a single MI300X with ROCm 6.3 and PyTorch 2.9.1. Three commands to reproduce:
+All code runs on MI300X with ROCm 6.3 and PyTorch 2.9.1. Three commands to reproduce:
 
 \begin{verbatim}
     # Build
@@ -344,20 +344,18 @@ All code runs on a single MI300X with ROCm 6.3 and PyTorch 2.9.1. Three commands
 \texttt{bench\_sdxl.py} (SDXL 1024$\times$1024 generation),
 \texttt{bench\_densenet.py} (DenseNet-161 single-image),
 \texttt{bench\_densenet\_imagenet.py} (DenseNet-161 full ImageNetV2 10K images),
-\texttt{demo.py} (60-second end-to-end demonstration).
+\texttt{demo.py} (end-to-end demonstration).
 
 % ═══════════════════════════════════════════════════════════════
 % CONCLUSION
 % ═══════════════════════════════════════════════════════════════
 \section{Conclusion}
 
-Large-tile Winograd convolution was abandoned by every major GPU vendor due to numerical instability in reduced precision. This report demonstrates that the instability is a \textit{point selection problem}, not a fundamental limitation. By using NOVA's optimized interpolation points, F(6,3) Winograd runs correctly in FP16 on AMD MI300X---beating MIOpen's own production F(2,3) kernel at inference latency, preserving full ImageNet accuracy across multiple architectures (ResNet-50, DenseNet-161), and generating valid images at both 512$\times$512 (SD~1.5) and 1024$\times$1024 (SDXL).
-
-The kernel exists. It works. It's a drop-in. And it's faster.
+Large-tile Winograd convolution was set aside by GPU vendors due to numerical instability in reduced precision. This report presents evidence that the instability is a point selection problem, not a fundamental limitation. With NOVA's interpolation points, F(6,3) Winograd runs correctly in FP16 on MI300X, matching or improving on MIOpen's F(2,3) at batch=1 inference latency, preserving ImageNet accuracy across multiple architectures (ResNet-50, DenseNet-161), and generating valid images at both 512$\times$512 (SD~1.5) and 1024$\times$1024 (SDXL).
 
 \vspace{1em}
 
 \noindent\rule{\textwidth}{0.4pt}
-{\small\color{gray} Contact: Jayant Lohia. All experiments conducted on AMD Instinct MI300X VF, 304 CUs, 205.8\,GB HBM3. NOVA point selection from the NOVA paper (arXiv). Code available upon request.}
+{\small\color{gray} Contact: Jayant Lohia. All experiments on AMD Instinct MI300X VF, 304 CUs, 205.8\,GB HBM3. NOVA point selection from the NOVA paper (arXiv). Code available upon request.}
 
 \end{document}
