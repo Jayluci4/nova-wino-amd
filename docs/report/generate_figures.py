@@ -254,7 +254,42 @@ def fig_full_perf():
     print("  full_perf.pdf")
 
 # ─────────────────────────────────────────────────────────────
-# Copy SD output image
+# Figure 6: Model generality — eligible layers across architectures
+# ─────────────────────────────────────────────────────────────
+def fig_model_generality():
+    models = [
+        'DenseNet-161', 'DenseNet-121', 'SD 1.5\nUNet', 'SDXL Base\nUNet',
+        'ResNet-50', 'EfficientNet', 'MobileNetV3', 'ConvNeXt',
+    ]
+    layers = [78, 58, 49, 38, 13, 0, 0, 0]
+    colors = [NOVA_BLUE if n > 0 else GRAY for n in layers]
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    bars = ax.barh(models, layers, color=colors, alpha=0.85,
+                   edgecolor='white', linewidth=0.5)
+
+    for bar, val in zip(bars, layers):
+        if val > 0:
+            ax.text(bar.get_width() + 1, bar.get_y() + bar.get_height()/2,
+                   str(val), va='center', fontsize=10, fontweight='bold',
+                   color=NOVA_BLUE)
+        else:
+            ax.text(bar.get_width() + 1, bar.get_y() + bar.get_height()/2,
+                   '0 (depthwise)', va='center', fontsize=9, color=GRAY,
+                   fontstyle='italic')
+
+    ax.set_xlabel('Eligible 3×3 stride=1 Conv2d Layers')
+    ax.set_title('NOVA Winograd Applicability Across Architectures', fontweight='bold')
+    ax.set_xlim(0, 95)
+    ax.invert_yaxis()
+
+    fig.savefig(f'{FIGDIR}/model_generality.pdf')
+    fig.savefig(f'{FIGDIR}/model_generality.png')
+    plt.close()
+    print("  model_generality.pdf")
+
+# ─────────────────────────────────────────────────────────────
+# Copy SD output images
 # ─────────────────────────────────────────────────────────────
 def copy_sd_image():
     src = '/root/nova_sd_output.png'
@@ -264,6 +299,15 @@ def copy_sd_image():
         print(f"  sd_output.png (copied)")
     else:
         print(f"  WARNING: {src} not found")
+
+def copy_sdxl_image():
+    src = '/root/nova-wino-amd/nova_sdxl_demo.png'
+    dst = f'{FIGDIR}/sdxl_output.png'
+    if os.path.exists(src):
+        shutil.copy2(src, dst)
+        print(f"  sdxl_output.png (copied)")
+    else:
+        print(f"  INFO: {src} not found (run bench_sdxl.py --save-images first)")
 
 # ─────────────────────────────────────────────────────────────
 # Run all
@@ -275,5 +319,7 @@ if __name__ == '__main__':
     fig_stability()
     fig_architecture()
     fig_full_perf()
+    fig_model_generality()
     copy_sd_image()
+    copy_sdxl_image()
     print("Done.")

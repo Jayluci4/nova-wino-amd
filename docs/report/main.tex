@@ -83,6 +83,7 @@ MIOpen has Winograd kernels only at F(2,3). There are no production kernels at l
     \item \textbf{Zero NaN/Inf}: Standard F(6,3) produces 221,000 NaN values on the same test. NOVA produces zero.
     \item \textbf{Drop-in PyTorch replacement}: One function call replaces all eligible Conv2d layers in any model.
     \item \textbf{Stable Diffusion works}: 49/49 UNet convolutions replaced, valid 512$\times$512 images generated, at 0.98$\times$ MIOpen step latency.
+    \item \textbf{Generalizes across architectures}: SDXL (38 layers, 1024$\times$1024) and DenseNet-161 (78 layers, full ImageNetV2 accuracy preserved).
 \end{itemize}
 
 The fix is mathematical, not architectural. NOVA selects optimal interpolation points for the Winograd transform that minimize condition numbers, reducing the maximum matrix entry from ${\sim}10$ to $2.72$---safely within FP16 dynamic range. This solves the exact instability that blocked AMD's prior attempts.
@@ -248,6 +249,42 @@ Image quality & Baseline & Visually identical \\
     \label{fig:sd}
 \end{figure}
 
+\noindent\textbf{Note on model architectures}: Newer diffusion models (SD3, Flux, SORA) use DiT (Diffusion Transformer) architectures built primarily on attention layers, not convolutions. Winograd does not apply to attention. However, UNet-based models (SD~1.5, SDXL, ControlNet, inpainting variants) remain the most widely deployed diffusion architectures and are dominated by 3$\times$3 convolutions.
+
+\subsection{SDXL: 1024$\times$1024 Generation}
+
+To validate beyond SD~1.5, we tested on SDXL Base---a larger UNet generating at 1024$\times$1024 resolution:
+
+\begin{table}[H]
+\centering
+\caption{SDXL Base UNet benchmark. NOVA replaces all eligible Conv2d layers and generates valid 1024$\times$1024 images with zero numerical failures.}
+\label{tab:sdxl}
+\small
+\begin{tabular}{lcc}
+\toprule
+& \textbf{MIOpen (Standard)} & \textbf{NOVA F(6,3)} \\
+\midrule
+Resolution & 1024$\times$1024 & 1024$\times$1024 \\
+Layers replaced & 0/38 & \textbf{38/38} \\
+NaN / Inf & 0 / 0 & \textbf{0 / 0} \\
+Image quality & Baseline & Visually identical \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{DenseNet-161: Architecture Generality}
+
+DenseNet-161 provides a different validation profile from ResNet-50: \textbf{78 eligible layers} (6$\times$ more than ResNet's 13) with smaller channel sizes (48--192 vs.\ 64--512). This exercises a broader range of the kernel's configuration space.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.75\textwidth]{figures/model_generality.png}
+    \caption{Eligible 3$\times$3 stride-1 convolution layers across architectures. DenseNet-161 has the most replaceable layers. Models dominated by depthwise convolutions (EfficientNet, MobileNet, ConvNeXt) have zero eligible layers.}
+    \label{fig:generality}
+\end{figure}
+
+\noindent Full ImageNetV2 validation (10,000 images) on DenseNet-161 confirms zero accuracy degradation with NOVA F(6,3) in FP16, matching the ResNet-50 result on a fundamentally different architecture.
+
 % ═══════════════════════════════════════════════════════════════
 % WHY THIS MATTERS
 % ═══════════════════════════════════════════════════════════════
@@ -303,19 +340,18 @@ All code runs on a single MI300X with ROCm 6.3 and PyTorch 2.9.1. Three commands
     python bench_nova_kernel.py
 \end{verbatim}
 
-\noindent \textbf{File inventory} (2,302 lines total):
-\texttt{nova\_winograd\_v1.hip} (906 lines --- HIP kernels + C API),
-\texttt{nova\_winograd\_ext.py} (537 --- PyTorch wrapper + model surgery),
-\texttt{test\_nova\_kernel.py} (460 --- 11 correctness tests),
-\texttt{nova\_sd\_demo.py} (234 --- SD benchmark),
-\texttt{bench\_nova\_kernel.py} (165 --- performance benchmark).
+\noindent \textbf{Additional benchmarks} (all under \texttt{benchmarks/}):
+\texttt{bench\_sdxl.py} (SDXL 1024$\times$1024 generation),
+\texttt{bench\_densenet.py} (DenseNet-161 single-image),
+\texttt{bench\_densenet\_imagenet.py} (DenseNet-161 full ImageNetV2 10K images),
+\texttt{demo.py} (60-second end-to-end demonstration).
 
 % ═══════════════════════════════════════════════════════════════
 % CONCLUSION
 % ═══════════════════════════════════════════════════════════════
 \section{Conclusion}
 
-Large-tile Winograd convolution was abandoned by every major GPU vendor due to numerical instability in reduced precision. This report demonstrates that the instability is a \textit{point selection problem}, not a fundamental limitation. By using NOVA's optimized interpolation points, F(6,3) Winograd runs correctly in FP16 on AMD MI300X---beating MIOpen's own production F(2,3) kernel at inference latency, preserving full ImageNet accuracy, and generating valid Stable Diffusion images.
+Large-tile Winograd convolution was abandoned by every major GPU vendor due to numerical instability in reduced precision. This report demonstrates that the instability is a \textit{point selection problem}, not a fundamental limitation. By using NOVA's optimized interpolation points, F(6,3) Winograd runs correctly in FP16 on AMD MI300X---beating MIOpen's own production F(2,3) kernel at inference latency, preserving full ImageNet accuracy across multiple architectures (ResNet-50, DenseNet-161), and generating valid images at both 512$\times$512 (SD~1.5) and 1024$\times$1024 (SDXL).
 
 The kernel exists. It works. It's a drop-in. And it's faster.
 
