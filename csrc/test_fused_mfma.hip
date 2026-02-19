@@ -162,12 +162,8 @@ void fused_winograd_mfma_kernel(
     const int P = nh * nw;
     const int BP = batch * P;
 
-    const int bp_base   = blockIdx.x * BP_PER_WG;
-    const int k_super_idx = blockIdx.y;   // which K_SUPER tile this WG handles
-    const int k_start   = k_super_idx * K_SUPER;
-    if (bp_base >= BP || k_start >= K) return;
-    const int k_end = min(k_start + K_SUPER, K);
-    const int n_k_chunks = (k_end - k_start + 15) / 16;
+    const int bp_base = blockIdx.x * BP_PER_WG;
+    if (bp_base >= BP) return;
 
     const int tid    = threadIdx.x;
     const int wf_id  = tid >> 6;
@@ -192,119 +188,124 @@ void fused_winograd_mfma_kernel(
     extern __shared__ __half lds_raw[];
     __half* V_lds = lds_raw;
 
-    // Accumulators: up to 4 k_chunks × 4 pos_batches
-    fp32x4_t acc[4][POS_PER_WF];
-    #pragma unroll
-    for (int kc = 0; kc < 4; kc++)
+    for (int k_super = 0; k_super < K; k_super += K_SUPER) {
+        const int k_super_end = min(k_super + K_SUPER, K);
+        const int n_k_chunks = (k_super_end - k_super + 15) / 16;
+
+        // Accumulators: up to 4 k_chunks × 4 pos_batches
+        fp32x4_t acc[4][POS_PER_WF];
         #pragma unroll
-        for (int pb = 0; pb < POS_PER_WF; pb++)
-            acc[kc][pb] = {0.0f, 0.0f, 0.0f, 0.0f};
-
-    // ════════ Phase 1 + 2: Transform once per c_chunk, accumulate all k_chunks ════════
-    for (int c_base = 0; c_base < C; c_base += C_CHUNK) {
-        // Phase 1: Input Transform → LDS (computed ONCE per c_chunk)
-        for (int c_local = 0; c_local < C_CHUNK && c_base + c_local < C; c_local++) {
-            int c = c_base + c_local;
-            float tile_val = 0.0f;
-            if (bp_valid && h_idx >= 0 && h_idx < H && w_idx >= 0 && w_idx < W)
-                tile_val = __half2float(input[((b_val * C + c) * H + h_idx) * W + w_idx]);
-
-            float temp = 0.0f;
+        for (int kc = 0; kc < 4; kc++)
             #pragma unroll
-            for (int kk = 0; kk < 8; kk++)
-                temp += __half2float(c_BT[row][kk]) * __shfl(tile_val, kk * 8 + col, 64);
+            for (int pb = 0; pb < POS_PER_WF; pb++)
+                acc[kc][pb] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-            float v_val = 0.0f;
-            #pragma unroll
-            for (int kk = 0; kk < 8; kk++)
-                v_val += __shfl(temp, row * 8 + kk, 64) * __half2float(c_B[kk][col]);
+        // ════════ Phase 1 + 2: Transform once per c_chunk, accumulate all k_chunks ════════
+        for (int c_base = 0; c_base < C; c_base += C_CHUNK) {
+            // Phase 1: Input Transform → LDS (computed ONCE per c_chunk)
+            for (int c_local = 0; c_local < C_CHUNK && c_base + c_local < C; c_local++) {
+                int c = c_base + c_local;
+                float tile_val = 0.0f;
+                if (bp_valid && h_idx >= 0 && h_idx < H && w_idx >= 0 && w_idx < W)
+                    tile_val = __half2float(input[((b_val * C + c) * H + h_idx) * W + w_idx]);
 
-            V_lds[pos * (C_CHUNK * 17) + c_local * 17 + bp_local] = __float2half(v_val);
-        }
-        __syncthreads();
+                float temp = 0.0f;
+                #pragma unroll
+                for (int kk = 0; kk < 8; kk++)
+                    temp += __half2float(c_BT[row][kk]) * __shfl(tile_val, kk * 8 + col, 64);
 
-        // Phase 2: MFMA for ALL k_chunks (reusing V from LDS)
-        for (int pos_batch = 0; pos_batch < 4; pos_batch++) {
-            int p = pos_batch * 16 + wf_id;
-            int t_row_mfma = lane % 16;
-            int t_grp_mfma = lane / 16;
+                float v_val = 0.0f;
+                #pragma unroll
+                for (int kk = 0; kk < 8; kk++)
+                    v_val += __shfl(temp, row * 8 + kk, 64) * __half2float(c_B[kk][col]);
 
-            // Load B from LDS (same for all k_chunks!)
-            fp16x4_t b;
-            int bp_col = lane % 16;
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                int c_local = 4 * t_grp_mfma + i;
-                b[i] = (_Float16)V_lds[p * (C_CHUNK * 17) + c_local * 17 + bp_col];
+                V_lds[pos * (C_CHUNK * 17) + c_local * 17 + bp_local] = __float2half(v_val);
             }
+            __syncthreads();
 
-            // MFMA for each k_chunk (different A, same B)
-            for (int kc = 0; kc < n_k_chunks; kc++) {
-                int k_base = k_start + kc * 16;
-                fp16x4_t a;
-                int k_g = k_base + t_row_mfma;
+            // Phase 2: MFMA for ALL k_chunks (reusing V from LDS)
+            for (int pos_batch = 0; pos_batch < 4; pos_batch++) {
+                int p = pos_batch * 16 + wf_id;
+                int t_row_mfma = lane % 16;
+                int t_grp_mfma = lane / 16;
+
+                // Load B from LDS (same for all k_chunks!)
+                fp16x4_t b;
+                int bp_col = lane % 16;
                 #pragma unroll
                 for (int i = 0; i < 4; i++) {
-                    int c_g = c_base + 4 * t_grp_mfma + i;
-                    if (k_g < K && c_g < C)
-                        a[i] = (_Float16)U_gemm[(long long)p * K * C + k_g + (long long)c_g * K];
-                    else
-                        a[i] = (_Float16)0;
+                    int c_local = 4 * t_grp_mfma + i;
+                    b[i] = (_Float16)V_lds[p * (C_CHUNK * 17) + c_local * 17 + bp_col];
                 }
-                acc[kc][pos_batch] = __builtin_amdgcn_mfma_f32_16x16x16f16(
-                    a, b, acc[kc][pos_batch], 0, 0, 0);
+
+                // MFMA for each k_chunk (different A, same B)
+                for (int kc = 0; kc < n_k_chunks; kc++) {
+                    int k_base = k_super + kc * 16;
+                    fp16x4_t a;
+                    int k_g = k_base + t_row_mfma;
+                    #pragma unroll
+                    for (int i = 0; i < 4; i++) {
+                        int c_g = c_base + 4 * t_grp_mfma + i;
+                        if (k_g < K && c_g < C)
+                            a[i] = (_Float16)U_gemm[(long long)p * K * C + k_g + (long long)c_g * K];
+                        else
+                            a[i] = (_Float16)0;
+                    }
+                    acc[kc][pos_batch] = __builtin_amdgcn_mfma_f32_16x16x16f16(
+                        a, b, acc[kc][pos_batch], 0, 0, 0);
+                }
             }
+            __syncthreads();
         }
-        __syncthreads();
-    }
 
-    // ════════ Phase 3: Output Transform per k_chunk ════════
-    __half* M_lds = lds_raw;
+        // ════════ Phase 3: Output Transform per k_chunk ════════
+        __half* M_lds = lds_raw;
 
-    for (int kc = 0; kc < n_k_chunks; kc++) {
-        int k_base = k_start + kc * 16;
+        for (int kc = 0; kc < n_k_chunks; kc++) {
+            int k_base = k_super + kc * 16;
 
-        // Write M to LDS
-        for (int pos_batch = 0; pos_batch < 4; pos_batch++) {
-            int p = pos_batch * 16 + wf_id;
-            int bp_col = lane % 16;
-            int k_grp = lane / 16;
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                int k_local = 4 * k_grp + i;
-                M_lds[k_local * 1024 + bp_col * 64 + p] = __float2half(acc[kc][pos_batch][i]);
+            // Write M to LDS
+            for (int pos_batch = 0; pos_batch < 4; pos_batch++) {
+                int p = pos_batch * 16 + wf_id;
+                int bp_col = lane % 16;
+                int k_grp = lane / 16;
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    int k_local = 4 * k_grp + i;
+                    M_lds[k_local * 1024 + bp_col * 64 + p] = __float2half(acc[kc][pos_batch][i]);
+                }
             }
+            __syncthreads();
+
+            // Output transform per k
+            for (int k_local = 0; k_local < 16 && k_base + k_local < K; k_local++) {
+                int k = k_base + k_local;
+                float m_val = __half2float(M_lds[k_local * 1024 + bp_local * 64 + pos]);
+
+                float out_temp = 0.0f;
+                #pragma unroll
+                for (int p = 0; p < 8; p++) {
+                    float m_p_col = __shfl(m_val, p * 8 + col, 64);
+                    if (row < 6) out_temp += __half2float(c_A[row][p]) * m_p_col;
+                }
+
+                float y_val = 0.0f;
+                #pragma unroll
+                for (int p = 0; p < 8; p++) {
+                    float temp_row_p = __shfl(out_temp, row * 8 + p, 64);
+                    if (row < 6 && col < 6)
+                        y_val += temp_row_p * __half2float(c_AT[p][col]);
+                }
+
+                if (bp_valid && row < 6 && col < 6) {
+                    int h_out = th * 6 + row;
+                    int w_out = tw * 6 + col;
+                    if (h_out < H_out && w_out < W_out)
+                        output[((b_val * K + k) * H_out + h_out) * W_out + w_out] = __float2half(y_val);
+                }
+            }
+            __syncthreads();
         }
-        __syncthreads();
-
-        // Output transform per k
-        for (int k_local = 0; k_local < 16 && k_base + k_local < K; k_local++) {
-            int k = k_base + k_local;
-            float m_val = __half2float(M_lds[k_local * 1024 + bp_local * 64 + pos]);
-
-            float out_temp = 0.0f;
-            #pragma unroll
-            for (int p = 0; p < 8; p++) {
-                float m_p_col = __shfl(m_val, p * 8 + col, 64);
-                if (row < 6) out_temp += __half2float(c_A[row][p]) * m_p_col;
-            }
-
-            float y_val = 0.0f;
-            #pragma unroll
-            for (int p = 0; p < 8; p++) {
-                float temp_row_p = __shfl(out_temp, row * 8 + p, 64);
-                if (row < 6 && col < 6)
-                    y_val += temp_row_p * __half2float(c_AT[p][col]);
-            }
-
-            if (bp_valid && row < 6 && col < 6) {
-                int h_out = th * 6 + row;
-                int w_out = tw * 6 + col;
-                if (h_out < H_out && w_out < W_out)
-                    output[((b_val * K + k) * H_out + h_out) * W_out + w_out] = __float2half(y_val);
-            }
-        }
-        __syncthreads();
     }
 }
 
@@ -411,8 +412,8 @@ int main() {
             d_in, d_wt, d_ref, cfg.batch, cfg.C, cfg.H, cfg.W, cfg.K, H_out, W_out, cfg.pad);
         HIP_CHECK(hipDeviceSynchronize());
 
-        // Fused MFMA kernel — 2D grid: (BP tiles, K tiles)
-        dim3 grid((BP + BP_PER_WG - 1) / BP_PER_WG, (cfg.K + K_SUPER - 1) / K_SUPER);
+        // Fused MFMA kernel — 1D grid over BP tiles
+        dim3 grid((BP + BP_PER_WG - 1) / BP_PER_WG);
         dim3 block(1024);
         int lds_bytes = 64 * C_CHUNK * 17 * sizeof(__half);
         // M_lds needs: 16 * 16 * 64 * 2 = 32768 bytes. V_lds needs 34816.
