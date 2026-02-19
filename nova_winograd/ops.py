@@ -37,12 +37,27 @@ def _ensure_lib():
     # Force torch to initialize CUDA/HIP runtime first
     torch.cuda.init()
 
-    # PyTorch bundles its own HSA runtime — make it globally visible
+    # Load HIP runtime — prefer system ROCm (matches hipcc version used to build .so),
+    # fall back to PyTorch's bundled libs
+    rocm_lib_dir = os.environ.get("ROCM_PATH", "/opt/rocm") + "/lib"
     torch_lib_dir = os.path.join(os.path.dirname(torch.__file__), "lib")
     for dep in ["libhsa-runtime64.so", "libamdhip64.so"]:
-        dep_path = os.path.join(torch_lib_dir, dep)
-        if os.path.exists(dep_path):
-            ctypes.CDLL(dep_path, mode=ctypes.RTLD_GLOBAL)
+        loaded = False
+        for lib_dir in [rocm_lib_dir, torch_lib_dir]:
+            dep_path = os.path.join(lib_dir, dep)
+            if os.path.exists(dep_path):
+                try:
+                    ctypes.CDLL(dep_path, mode=ctypes.RTLD_GLOBAL)
+                    loaded = True
+                    break
+                except OSError:
+                    continue
+        if not loaded:
+            # Last resort: let the system find it
+            try:
+                ctypes.CDLL(dep, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
 
     # Load our library
     lib_path = _find_lib()
