@@ -673,9 +673,9 @@ int main() {
     };
     int num_configs = sizeof(configs) / sizeof(configs[0]);
 
-    printf("%-14s | %8s %9s | %8s %9s | %7s | %s\n",
-           "Config", "3-pass", "GFLOPS", "Fused", "GFLOPS", "Speedup", "Status");
-    printf("─────────────────────────────────────────────────────────────────────────────────\n");
+    printf("%-14s | %8s %9s | %8s %9s | %7s | %8s | %s\n",
+           "Config", "3-pass", "GFLOPS", "Fused", "GFLOPS", "Speedup", "WS Save", "Status");
+    printf("────────────────────────────────────────────────────────────────────────────────────────\n");
 
     for (int ci = 0; ci < num_configs; ci++) {
         auto& cfg = configs[ci];
@@ -828,11 +828,13 @@ int main() {
 
         double flops = 2.0 * cfg.batch * cfg.K * cfg.C * H_out * W_out * 9;
         float speedup = ms_3pass / ms_fused;
-        printf("%-14s | %6.3fms %7.1f G | %6.3fms %7.1f G | %5.2fx  | %s\n",
+        // Workspace memory saved by fused kernel (V_gemm + M_gemm)
+        double ws_mb = (64LL * cfg.C * BP + 64LL * cfg.K * BP) * 2.0 / (1024.0 * 1024.0);
+        printf("%-14s | %6.3fms %7.1f G | %6.3fms %7.1f G | %5.2fx  | %5.1f MB | %s\n",
                cfg.name,
                ms_3pass, flops / (ms_3pass * 1e6),
                ms_fused, flops / (ms_fused * 1e6),
-               speedup,
+               speedup, ws_mb,
                pass ? "PASS" : "FAIL");
 
         rocblas_destroy_handle(rb_handle);
