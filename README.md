@@ -70,6 +70,21 @@ make          # Builds HIP kernel → nova_winograd/lib/libnova_winograd.so
 
 ## Architecture
 
+NOVA provides two pipelines selected automatically at runtime:
+
+### Fused MFMA Pipeline (K,C ≤ 64 — conv2_x layers)
+
+Single-kernel: fuses input transform, GEMM, and output transform via `mfma_f32_16x16x16f16` intrinsics. Zero intermediate buffers.
+
+```
+Input [B,C,H,W]  →  Fused Kernel (1024 threads, LDS-staged)  →  Output [B,K,H,W]
+                     Phase 1: B^T · tile · B  (__shfl → LDS)
+                     Phase 2: MFMA accumulate  (LDS → registers)
+                     Phase 3: A · M · A^T     (LDS → __shfl → global)
+```
+
+### 3-Pass Pipeline (K,C > 64 — conv3_x+ layers)
+
 ```
 Input [B,C,H,W]  →  Input Transform (HIP)  →  rocBLAS Batched GEMM  →  Output Transform (HIP)  →  Output [B,K,H,W]
                      B^T · tile · B              64× [K,C]·[C,P]          A · M · A^T
@@ -80,6 +95,7 @@ Input [B,C,H,W]  →  Input Transform (HIP)  →  rocBLAS Batched GEMM  →  Out
 - **Transforms**: Custom HIP kernels, 4 tiles/workgroup (256 threads), register-only via `__shfl`
 - **GEMM**: rocBLAS `gemm_strided_batched_ex` — FP16 in, FP32 accumulation, FP16 out
 - **Filter transform**: Computed once, cached across forward passes
+- **Runtime dispatch**: `NovaWinogradFused` selects fused or 3-pass based on layer dimensions
 
 ## API Reference
 
@@ -104,7 +120,8 @@ Input [B,C,H,W]  →  Input Transform (HIP)  →  rocBLAS Batched GEMM  →  Out
 ```
 nova-wino-amd/
 ├── csrc/
-│   └── nova_winograd.hip          # HIP kernels + host class + C API (906 lines)
+│   ├── nova_winograd.hip          # 3-pass pipeline: transforms + rocBLAS GEMM + C API
+│   └── nova_winograd_fused.hip    # Fused MFMA kernel with runtime dispatch + C API
 ├── nova_winograd/
 │   ├── __init__.py                 # Package exports
 │   ├── ops.py                      # ctypes bridge to .so
@@ -139,7 +156,13 @@ nova-wino-amd/
 
 ### Batch > 1
 
-MIOpen's fused single-kernel F(2,3) wins at larger batches (1.5–4.2x). The gap narrows with `fp16_alt_impl` (available in ROCm 7.x).
+The fused MFMA kernel eliminates the batch>1 performance gap for conv2_x layers while saving 60+ MB of workspace memory:
+
+| Layer (B=32) | 3-Pass (original) | Fused MFMA | Speedup | Workspace Saved |
+|--------------|:-----------------:|:----------:|:-------:|:---------------:|
+| conv2_x (64ch, 56×56) | 0.585 ms | **0.385 ms** | 1.52× | 60.5 MB |
+
+For larger layers (conv3_x+), the 3-pass pipeline with pre-allocated workspace is used automatically via runtime dispatch. MIOpen's fused single-kernel F(2,3) remains competitive at these sizes.
 
 ## Technical Report
 
