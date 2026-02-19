@@ -450,12 +450,21 @@ public:
     rocblas_handle handle_;
     bool initialized_;
 
-    NovaWinogradFused() : K_(0), C_(0), d_U_gemm_(nullptr), initialized_(false) {
+    // Pre-allocated workspace for 3-pass fallback (reused across calls)
+    __half* d_V_gemm_;
+    __half* d_M_gemm_;
+    int ws_BP_;  // BP dimension workspace was allocated for
+
+    NovaWinogradFused() : K_(0), C_(0), d_U_gemm_(nullptr),
+                          d_V_gemm_(nullptr), d_M_gemm_(nullptr), ws_BP_(0),
+                          initialized_(false) {
         ROCBLAS_CHECK(rocblas_create_handle(&handle_));
     }
 
     ~NovaWinogradFused() {
         if (d_U_gemm_) hipFree(d_U_gemm_);
+        if (d_V_gemm_) hipFree(d_V_gemm_);
+        if (d_M_gemm_) hipFree(d_M_gemm_);
         rocblas_destroy_handle(handle_);
     }
 
@@ -466,10 +475,16 @@ public:
         HIP_CHECK(hipMalloc(&d_U_gemm_, 64LL * K * C * sizeof(__half)));
         filter_transform_kernel<<<K * C, 64>>>(d_weight, d_U_gemm_, K, C);
         HIP_CHECK(hipGetLastError());
+        // Reset workspace when weights change (dimensions may differ)
+        if (d_V_gemm_) { hipFree(d_V_gemm_); d_V_gemm_ = nullptr; }
+        if (d_M_gemm_) { hipFree(d_M_gemm_); d_M_gemm_ = nullptr; }
+        ws_BP_ = 0;
         initialized_ = true;
     }
 
-    // Forward with runtime dispatch: fused MFMA for small K,C; 3-pass for large
+    // Forward with runtime dispatch:
+    //   K,C ≤ 64: fused MFMA (zero workspace, single kernel)
+    //   Otherwise: 3-pass with pre-allocated workspace
     void forward(
         const __half* d_input, __half* d_output,
         int batch, int H, int W, int pad,
@@ -492,9 +507,8 @@ public:
         int P = nh * nw;
         int BP = batch * P;
 
-        // Use fused MFMA for conv2_x-sized layers (K,C ≤ 64)
-        // with sufficient batch parallelism (BP ≥ 16)
-        bool use_fused = (K_ <= 64 && C_ <= 64 && BP >= 16);
+        // Fused MFMA for conv2_x-sized layers: zero workspace, single kernel
+        bool use_fused = (K_ <= 64 && C_ <= 64);
 
         if (use_fused) {
             forward_fused(d_input, d_output, batch, H, W, pad,
@@ -503,6 +517,20 @@ public:
             forward_3pass(d_input, d_output, batch, H, W, pad,
                           nh, nw, H_out, W_out, BP, stream);
         }
+    }
+
+    // Return workspace memory in bytes needed for current config
+    // (0 for fused path, V_gemm + M_gemm for 3-pass path)
+    long long workspace_bytes(int batch, int H, int W, int pad) const {
+        if (K_ <= 64 && C_ <= 64) return 0;
+        const int m = 6, n = 8;
+        int H_out = H + 2 * pad - 2, W_out = W + 2 * pad - 2;
+        int H_pad = H_out + n - 1, W_pad = W_out + n - 1;
+        H_pad += (m - (H_pad - n) % m) % m;
+        W_pad += (m - (W_pad - n) % m) % m;
+        int nh = (H_pad - n) / m + 1, nw = (W_pad - n) / m + 1;
+        int BP = batch * nh * nw;
+        return (64LL * C_ * BP + 64LL * K_ * BP) * sizeof(__half);
     }
 
 private:
@@ -524,25 +552,32 @@ private:
         HIP_CHECK(hipGetLastError());
     }
 
+    void ensure_workspace(int BP) {
+        if (BP <= ws_BP_) return;
+        if (d_V_gemm_) hipFree(d_V_gemm_);
+        if (d_M_gemm_) hipFree(d_M_gemm_);
+        HIP_CHECK(hipMalloc(&d_V_gemm_, 64LL * C_ * BP * sizeof(__half)));
+        HIP_CHECK(hipMalloc(&d_M_gemm_, 64LL * K_ * BP * sizeof(__half)));
+        ws_BP_ = BP;
+    }
+
     void forward_3pass(
         const __half* d_input, __half* d_output,
         int batch, int H, int W, int pad,
         int nh, int nw, int H_out, int W_out, int BP,
         hipStream_t stream)
     {
-        __half *d_V_gemm, *d_M_gemm;
-        HIP_CHECK(hipMalloc(&d_V_gemm, 64LL * C_ * BP * sizeof(__half)));
-        HIP_CHECK(hipMalloc(&d_M_gemm, 64LL * K_ * BP * sizeof(__half)));
-
+        ensure_workspace(BP);
         rocblas_set_stream(handle_, stream);
 
-        // Input transform
         int P = nh * nw;
+
+        // Input transform
         int input_tiles = batch * C_ * P;
         int input_blocks = (input_tiles + TILES_PER_WG - 1) / TILES_PER_WG;
         hipLaunchKernelGGL(input_transform_kernel_mt, dim3(input_blocks), dim3(64 * TILES_PER_WG),
                            0, stream,
-                           d_input, d_V_gemm,
+                           d_input, d_V_gemm_,
                            batch, C_, H, W, pad, nh, nw, BP, input_tiles);
 
         // rocBLAS strided batched GEMM
@@ -553,10 +588,10 @@ private:
             K_, BP, C_,
             &alpha,
             d_U_gemm_, rocblas_datatype_f16_r, K_, (rocblas_stride)(K_ * C_),
-            d_V_gemm,  rocblas_datatype_f16_r, C_, (rocblas_stride)(C_ * BP),
+            d_V_gemm_, rocblas_datatype_f16_r, C_, (rocblas_stride)(C_ * BP),
             &beta,
-            d_M_gemm,  rocblas_datatype_f16_r, K_, (rocblas_stride)(K_ * BP),
-            d_M_gemm,  rocblas_datatype_f16_r, K_, (rocblas_stride)(K_ * BP),
+            d_M_gemm_, rocblas_datatype_f16_r, K_, (rocblas_stride)(K_ * BP),
+            d_M_gemm_, rocblas_datatype_f16_r, K_, (rocblas_stride)(K_ * BP),
             64, rocblas_datatype_f32_r,
             rocblas_gemm_algo_standard, 0, 0
         ));
@@ -566,11 +601,8 @@ private:
         int output_blocks = (output_tiles + TILES_PER_WG - 1) / TILES_PER_WG;
         hipLaunchKernelGGL(output_transform_kernel_mt, dim3(output_blocks), dim3(64 * TILES_PER_WG),
                            0, stream,
-                           d_M_gemm, d_output,
+                           d_M_gemm_, d_output,
                            batch, K_, H_out, W_out, nh, nw, BP, output_tiles);
-
-        HIP_CHECK(hipFree(d_V_gemm));
-        HIP_CHECK(hipFree(d_M_gemm));
     }
 };
 
